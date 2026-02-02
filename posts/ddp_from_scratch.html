@@ -27,225 +27,56 @@
 
                 <h2>Motivation: Why Build DDP From Scratch?</h2>
 
-                <p>DDP is the first step towards distributed training. Often neglicted by many people because you "just" duplicate your training script and add a few lines of code:</p>
+                <p>DDP is the first step towards distributed training. Often neglicted by many people because of its simplicity. You just import <code>torch.distributed</code> modify few lines of code and run your training script with <code>torchrun</code>:</p>
+               
+                <p>Okay maybe it's a bit true, but we will see that there is more to it than that.
+                In this post we will go from a naive implementation to an optimized one that can achieve up to <strong>95% of the performance of PyTorch DDP</strong>.</p>
 
-                <pre><code>torchrun --nproc_per_node=2 train.py</code></pre>
 
-                <p>Okay maybe its a bit true, but how can you optimize something that is so easy to use?</p>
+                <h2>Sharded Data Loading</h2>
 
-                <h2>The Roadmap: A Step-by-Step Journey</h2>
-
-                <p>I approached this implementation incrementally, verifying correctness at each step:</p>
-
-                <h3>Step 0: Single-GPU Baseline</h3>
-                <p>Before going distributed, establish a reliable single-GPU baseline with all the production features: gradient accumulation, mixed precision (AMP), gradient clipping, learning rate scheduling, checkpointing, and comprehensive logging.</p>
-
-                <h3>Step 1: PyTorch DDP Golden Baseline</h3>
-                <p>Run the same training script with PyTorch's official DDP. Save checkpoints at specific steps (5, 20, 100) to compare against our custom implementation. This gives us ground truth for correctness verification.</p>
-
-                <h3>Step 2: Sharded Data Loading</h3>
-                <p>Implement deterministic dataset sharding across ranks. Each process must see different data, but in a reproducible way. The key is the <code>ShardSampler</code>:</p>
-
-                <pre><code>class ShardSampler(Sampler[int]):
-    def __init__(self, dataset_len, rank, world_size,
-                 shuffle=True, seed=0, drop_last=True):
-        self.dataset_len = dataset_len
-        self.rank = rank
-        self.world_size = world_size
-        self.epoch = 0
-
-    def set_epoch(self, epoch: int):
-        # Change seed each epoch for different shuffling
-        self.epoch = epoch
-
-    def __iter__(self):
-        # Deterministic shuffle based on seed + epoch
-        if self.shuffle:
-            generator = torch.Generator().manual_seed(
-                self.seed + self.epoch
-            )
-            indices = torch.randperm(
-                self.dataset_len, generator=generator
-            ).tolist()
-
-        # Shard by rank: each process gets every Nth sample
-        indices = indices[self.rank::self.world_size]
-        return iter(indices)</code></pre>
-
-                <p>This ensures no sample overlap across ranks while maintaining reproducibility.</p>
-
-                <h3>Step 3: Naive Data Parallelism</h3>
-                <p>The simplest form of DDP: broadcast model parameters from rank 0, run backward pass independently on each rank, then all-reduce gradients before the optimizer step.</p>
-
-                <pre><code>def broadcast_model(model: torch.nn.Module, src: int = 0):
-    """Broadcast all model parameters from source rank."""
-    for p in model.parameters():
-        dist.broadcast(p.data, src=src)
-
-def sync_gradients(model: torch.nn.Module, world_size: int):
-    """Synchronize gradients across all ranks."""
-    for p in model.parameters():
-        if p.grad is not None:
-            # Sum gradients from all ranks
-            dist.all_reduce(p.grad.data, op=dist.ReduceOp.SUM)
-            # Average by dividing by world_size
-            p.grad.data /= world_size</code></pre>
-
-                <p>This works but is inefficient: we wait for the entire backward pass to complete before starting communication.</p>
-
-                <h3>Step 4: Gradient Bucketing (Real DDP)</h3>
-                <p>The key optimization: overlap backward computation with gradient communication using autograd hooks and gradient bucketing.</p>
-
-                <h2>The Heart of DDP: Gradient Bucketing</h2>
-
-                <p>The <code>GradientBucketer</code> is where the magic happens. Here's how it works:</p>
-
-                <h3>1. Group Parameters into Buckets</h3>
-                <p>Divide model parameters into buckets (~25MB each). Parameters are processed in reverse order (last layers first) because backward pass executes in reverse topological order.</p>
-
-                <pre><code>def _build_buckets(self, model, bucket_size_mb):
-    bucket_size_bytes = bucket_size_mb * 1024 * 1024
-    current_bucket_params = []
-    current_bucket_size = 0
-
-    # Iterate parameters in REVERSE order
-    for param in reversed(list(model.parameters())):
-        param_size = param.numel() * param.element_size()
-
-        # Start new bucket if current is full
-        if (current_bucket_size + param_size > bucket_size_bytes
-            and len(current_bucket_params) > 0):
-            self._finalize_bucket(current_bucket_params)
-            current_bucket_params = []
-            current_bucket_size = 0
-
-        current_bucket_params.append(param)
-        current_bucket_size += param_size
-
-    # Don't forget the last bucket!
-    if current_bucket_params:
-        self._finalize_bucket(current_bucket_params)</code></pre>
-
-                <h3>2. Register Backward Hooks</h3>
-                <p>Attach a hook to each parameter that fires when its gradient is ready. Use <code>register_post_accumulate_grad_hook</code> for compatibility with gradient accumulation.</p>
-
-                <pre><code>def _register_hooks(self, model):
-    for param in model.parameters():
-        if not param.requires_grad:
-            continue
-        hook = param.register_post_accumulate_grad_hook(
-            self._on_grad_ready
-        )
-        self._hooks.append(hook)</code></pre>
-
-                <h3>3. Copy Gradients to Bucket Buffer</h3>
-                <p>When a gradient becomes ready, copy it into the bucket's flat buffer. When all parameters in a bucket are ready, trigger async all-reduce.</p>
-
-                <pre><code>def _on_grad_ready(self, param):
-    bucket_idx = self.param_to_bucket_idx[param]
-    bucket = self.buckets[bucket_idx]
-
-    # Copy gradient to flat buffer
-    start, end = bucket.offsets[param]
-    bucket.buffer[start:end] = param.grad.flatten()
-
-    bucket.num_params_ready += 1
-
-    # If bucket complete, start async all-reduce
-    if bucket.is_complete():
-        bucket.async_handle = dist.all_reduce(
-            bucket.buffer,
-            op=dist.ReduceOp.SUM,
-            async_op=True
-        )</code></pre>
-
-                <h3>4. Wait and Copy Back</h3>
-                <p>Before the optimizer step, wait for all async operations to complete, average the gradients, and copy them back to parameters.</p>
-
-                <pre><code>def wait_for_all_reduces(self):
-    for bucket in self.buckets:
-        if bucket.async_handle is not None:
-            bucket.async_handle.wait()
-
-        # Average gradients
-        bucket.buffer /= self.world_size
-
-        # Copy back to parameters
-        for param in bucket.params:
-            start, end = bucket.offsets[param]
-            param.grad = bucket.buffer[start:end].view_as(
-                param.grad
-            )</code></pre>
-
-                <h2>Handling Gradient Accumulation</h2>
-
-                <p>Gradient accumulation with DDP requires careful synchronization. We only want to communicate gradients on accumulation boundaries:</p>
-
-                <pre><code># Use no_sync() context to disable gradient sync
-if (step + 1) % GRAD_ACCUM_STEPS != 0:
-    with bucketer.no_sync():
-        loss.backward()  # No communication
-else:
-    loss.backward()  # Communication enabled
-
-    bucketer.wait_for_all_reduces()
-    optimizer.step()
-    bucketer.reset()</code></pre>
-
-                <p>The <code>no_sync()</code> context manager temporarily disables hooks, allowing gradients to accumulate locally.</p>
-
-                <h2>Verification: Comparing Against PyTorch DDP</h2>
-
-                <p>To verify correctness, I implemented a checkpoint comparison script that checks:</p>
-
+                <p>
+                In Distributed Data Parallel (DDP) training, data is typically sharded across
+                ranks so that each process works on a different subset of the dataset.
+                This sharding is handled by the DataLoader and its sampler, not by DDP itself.
+                </p>
+                
+                <p>
+                In pytorch, this is commonly done using
+                <code>torch.utils.data.distributed.DistributedSampler</code>, here we will implement a custom sampler that does essentially the same thing, you can find the implementation <a href="https://github.com/Deep-unlearning/ddp_from_scratch/blob/master/ddp/sampler.py">here</a>.
+                </p>
+                
+                <p>The implementation is quite straightforward, the important things to remember are that:</p>
+                
                 <ul>
-                    <li>Model weights match within numerical tolerance (rtol=1e-5, atol=1e-6)</li>
-                    <li>Optimizer states are identical</li>
-                    <li>Training loss trajectories align</li>
-                    <li>Parameter norms match (difference < 1e-6)</li>
+                  <li>
+                    pytorch’s distributed sampler performs an interleaved (strided) slicing of
+                    dataset indices. For example, with 4 ranks and 16 samples, rank 0 receives
+                    <code>[0, 4, 8, 12]</code>, rank 1 receives <code>[1, 5, 9, 13]</code>,
+                    rank 2 receives <code>[2, 6, 10, 14]</code>, and rank 3 receives
+                    <code>[3, 7, 11, 15]</code>.
+                  </li>
+                
+                  <li>
+                    The <code>drop_last</code> parameter controls how the sampler handles cases
+                    where the dataset size is not divisible by the number of ranks.
+                    If <code>drop_last=True</code>, extra samples are dropped.
+                    If <code>drop_last=False</code>, the sampler pads the list of dataset indices
+                    by repeating from the beginning of the index list (after optional shuffling)
+                    so that the total number of samples is divisible by the number of ranks.
+                    For example, with 4 ranks and 15 samples (no shuffling), rank 0 receives
+                    <code>[0, 4, 8, 12]</code>, rank 1 receives <code>[1, 5, 9, 13]</code>,
+                    rank 2 receives <code>[2, 6, 10, 14]</code>, and rank 3 receives
+                    <code>[3, 7, 11, 0]</code>.
+                  </li>
                 </ul>
+                
+                
+                <h2>Naive Implementation</h2>
 
-                <p>After hours of debugging (mostly around edge cases in bucket finalization and hook timing), my implementation produces identical results to PyTorch DDP!</p>
-
-                <h2>Performance: Communication Overlap</h2>
-
-                <p>The key benefit of bucketing is overlapping computation with communication. During backward pass:</p>
-
-                <pre>Time →
-Rank 0: [Compute Layer N] [Compute Layer N-1] [Compute Layer N-2]
-        [AllReduce Bucket 1][AllReduce Bucket 2]
-                                ↑ overlap</pre>
-
-                <p>Without bucketing, you'd wait for all gradients before starting communication. With bucketing, communication starts as soon as the first bucket (last layers) is ready, overlapping with computation of earlier layers.</p>
-
-                <h2>Key Insights</h2>
-
-                <ul>
-                    <li><strong>Reverse Order Matters:</strong> Parameters must be bucketed in reverse order to match backward execution order</li>
-                    <li><strong>Hook Timing:</strong> Use <code>post_accumulate_grad_hook</code> for correct behavior with gradient accumulation</li>
-                    <li><strong>Flat Buffers:</strong> Flatten gradients into contiguous buffers for efficient communication</li>
-                    <li><strong>Async Operations:</strong> Use <code>async_op=True</code> for overlap, but remember to wait before optimizer step</li>
-                    <li><strong>Deterministic Sharding:</strong> Seed-based shuffling ensures reproducible data distribution</li>
-                </ul>
-
-                <h2>What's Next?</h2>
-
-                <p>This implementation covers the core DDP algorithm, but there's more to explore:</p>
-
-                <ul>
-                    <li>FSDP (Fully Sharded Data Parallel) for sharding parameters, not just data</li>
-                    <li>Gradient compression techniques</li>
-                    <li>Hierarchical all-reduce for multi-node setups</li>
-                    <li>Custom communication backends</li>
-                </ul>
+                <h2>Gradient Bucketing and Autograd Hooks</h2>
 
                 <h2>Conclusion</h2>
-
-                <p>Building DDP from scratch taught me more about distributed training than reading documentation ever could. The implementation is simpler than I expected (~200 lines for the bucketer), but getting the details right requires careful thinking about execution order, synchronization points, and numerical stability.</p>
-
-                <p>If you're curious about distributed training internals, I highly recommend this exercise. Start with the naive synchronous version, get it working, then add optimizations incrementally. The <a href="https://github.com/Deep-unlearning/ddp_from_scratch">full code</a> includes tests, verification scripts, and detailed comments.</p>
-
-                <p>Questions or suggestions? Feel free to open an issue on the repository or reach out!</p>
 
                 <a href="../blog.html" class="back-link">← Back to blog</a>
             </article>
