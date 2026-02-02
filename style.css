@@ -36,6 +36,10 @@ nav a:hover {
     opacity: 0.6;
 }
 
+.intro {
+    margin-bottom: 40px;
+}
+
 main {
     flex: 1;
 }
