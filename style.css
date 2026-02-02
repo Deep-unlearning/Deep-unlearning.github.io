@@ -61,12 +61,14 @@ footer {
 .social-links {
     display: flex;
     gap: 20px;
+    background: none;
 }
 
 .social-links a {
     color: #333;
     text-decoration: none;
     font-size: 14px;
+    background: none;
 }
 
 .social-links a:hover {
@@ -139,13 +141,16 @@ article a:hover {
 }
 
 article ul, article ol {
-    margin-left: 25px;
+    margin-left: 0;
+    padding-left: 1.5em;
     margin-bottom: 20px;
+    list-style-position: outside;
 }
 
 article li {
     margin-bottom: 8px;
     font-size: 14px;
+    padding-left: 0.25em;
 }
 
 .back-link {
